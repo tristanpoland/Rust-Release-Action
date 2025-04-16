@@ -1,0 +1,393 @@
+name: 'Rust Multi-Platform Release'
+description: 'Automatically create releases and build multi-platform binaries for Rust projects'
+author: 'Your Name'
+branding:
+  icon: 'package'
+  color: 'orange'
+
+inputs:
+  token:
+    description: 'GitHub token'
+    required: true
+    default: ${{ github.token }}
+  
+  release_name:
+    description: 'Format for release name'
+    required: false
+    default: 'Release v{version}'
+  
+  tag_name:
+    description: 'Format for tag name'
+    required: false
+    default: 'v{version}'
+  
+  draft:
+    description: 'Create release as draft'
+    required: false
+    default: 'false'
+  
+  prerelease:
+    description: 'Create release as prerelease'
+    required: false
+    default: 'false'
+  
+  targets:
+    description: 'Comma-separated list of targets to build'
+    required: false
+    default: >-
+      x86_64-unknown-linux-gnu,
+      x86_64-unknown-linux-musl,
+      aarch64-unknown-linux-gnu,
+      aarch64-unknown-linux-musl,
+      i686-unknown-linux-gnu,
+      i686-unknown-linux-musl,
+      armv7-unknown-linux-gnueabihf,
+      armv7-unknown-linux-musleabihf,
+      x86_64-pc-windows-msvc,
+      i686-pc-windows-msvc,
+      aarch64-pc-windows-msvc,
+      x86_64-apple-darwin,
+      aarch64-apple-darwin,
+      wasm32-unknown-unknown
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Check out repository
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 2
+    
+    - name: Get package name from Cargo.toml
+      id: get-name
+      shell: bash
+      run: |
+        PACKAGE_NAME=$(grep -m1 '^name' Cargo.toml | sed 's/name\s*=\s*"\(.*\)"/\1/')
+        echo "package_name=$PACKAGE_NAME" >> $GITHUB_OUTPUT
+        echo "Package name: $PACKAGE_NAME"
+    
+    - name: Check if Cargo.toml version changed
+      id: check
+      shell: bash
+      run: |
+        CURRENT_VERSION=$(grep -m1 version Cargo.toml | cut -d '"' -f2)
+        git checkout HEAD^1
+        PREVIOUS_VERSION=$(grep -m1 version Cargo.toml | cut -d '"' -f2)
+        git checkout -
+        if [ "$CURRENT_VERSION" != "$PREVIOUS_VERSION" ]; then
+          echo "should_release=true" >> $GITHUB_OUTPUT
+          echo "version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "Version changed: $PREVIOUS_VERSION -> $CURRENT_VERSION"
+        else
+          echo "should_release=false" >> $GITHUB_OUTPUT
+          echo "Version unchanged: $CURRENT_VERSION"
+        fi
+    
+    - name: Create Release
+      id: create_release
+      if: steps.check.outputs.should_release == 'true'
+      uses: softprops/action-gh-release@v1
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+      with:
+        tag_name: ${{ inputs.tag_name == '' && format('v{0}', steps.check.outputs.version) || format(inputs.tag_name, steps.check.outputs.version) }}
+        name: ${{ inputs.release_name == '' && format('Release v{0}', steps.check.outputs.version) || format(inputs.release_name, steps.check.outputs.version) }}
+        draft: ${{ inputs.draft }}
+        prerelease: ${{ inputs.prerelease }}
+    
+    # Determine targets to build based on runner OS
+    - name: Determine builds for this runner
+      id: determine-builds
+      if: steps.check.outputs.should_release == 'true'
+      shell: bash
+      run: |
+        ALL_TARGETS="${{ inputs.targets }}"
+        RUNNER_OS="${{ runner.os }}"
+        
+        # Convert comma-separated list to array
+        IFS=',' read -ra TARGET_ARRAY <<< "$ALL_TARGETS"
+        
+        # Filter targets based on runner OS
+        NATIVE_TARGETS=()
+        CROSS_TARGETS=()
+        
+        for target in "${TARGET_ARRAY[@]}"; do
+          target=$(echo "$target" | xargs)  # Trim whitespace
+          
+          # Skip empty targets
+          if [ -z "$target" ]; then
+            continue
+          fi
+          
+          # Determine if this is a target for the current runner
+          case "$RUNNER_OS" in
+            Linux)
+              if [[ "$target" == *-linux-* ]] || [[ "$target" == wasm32-* ]]; then
+                CROSS_TARGETS+=("$target")
+              fi
+              ;;
+            Windows)
+              if [[ "$target" == *-windows-* ]]; then
+                NATIVE_TARGETS+=("$target")
+              fi
+              ;;
+            macOS)
+              if [[ "$target" == *-apple-* ]]; then
+                NATIVE_TARGETS+=("$target")
+              fi
+              ;;
+          esac
+        done
+        
+        # Output target lists
+        echo "native_targets=${NATIVE_TARGETS[*]}" >> $GITHUB_OUTPUT
+        echo "cross_targets=${CROSS_TARGETS[*]}" >> $GITHUB_OUTPUT
+        
+        echo "Native targets: ${NATIVE_TARGETS[*]}"
+        echo "Cross targets: ${CROSS_TARGETS[*]}"
+    
+    # Install Rust
+    - name: Install Rust
+      if: steps.check.outputs.should_release == 'true'
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+    
+    # Install native build dependencies
+    - name: Install macOS dependencies
+      if: runner.os == 'macOS' && steps.check.outputs.should_release == 'true'
+      shell: bash
+      run: |
+        brew update
+        brew install openssl@1.1 protobuf@3
+        echo "OPENSSL_DIR=$(brew --prefix openssl@1.1)" >> $GITHUB_ENV
+        echo "PATH=$(brew --prefix protobuf@3)/bin:$PATH" >> $GITHUB_ENV
+        brew link --force protobuf@3
+    
+    - name: Install Linux dependencies
+      if: runner.os == 'Linux' && steps.check.outputs.should_release == 'true'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y pkg-config libssl-dev
+    
+    # Install cross for Linux cross-compilation
+    - name: Install cross
+      if: runner.os == 'Linux' && steps.check.outputs.should_release == 'true'
+      shell: bash
+      run: |
+        cargo install cross --git https://github.com/cross-rs/cross
+    
+    # Build for native targets
+    - name: Build native targets
+      if: steps.check.outputs.should_release == 'true' && steps.determine-builds.outputs.native_targets != ''
+      shell: bash
+      env:
+        RUST_BACKTRACE: 1
+      run: |
+        PACKAGE_NAME="${{ steps.get-name.outputs.package_name }}"
+        
+        # Loop through all native targets
+        for target in ${{ steps.determine-builds.outputs.native_targets }}; do
+          echo "Building native target: $target"
+          
+          # Add target
+          rustup target add $target
+          
+          # Build
+          cargo build --release --target $target
+          
+          # Determine file extension
+          extension=""
+          if [[ "$target" == *-windows-* ]]; then
+            extension=".exe"
+          elif [[ "$target" == *wasm32-* ]]; then
+            extension=".wasm"
+          fi
+          
+          # Determine asset name suffix
+          asset_suffix=""
+          if [[ "$target" == *-windows-* ]]; then
+            if [[ "$target" == *-x86_64-* ]]; then
+              asset_suffix="-windows-x86_64.exe"
+            elif [[ "$target" == *-i686-* ]]; then
+              asset_suffix="-windows-i686.exe"
+            elif [[ "$target" == *-aarch64-* ]]; then
+              asset_suffix="-windows-arm64.exe"
+            fi
+          elif [[ "$target" == *-apple-* ]]; then
+            if [[ "$target" == *-x86_64-* ]]; then
+              asset_suffix="-macos-x86_64"
+            elif [[ "$target" == *-aarch64-* ]]; then
+              asset_suffix="-macos-arm64"
+            fi
+          elif [[ "$target" == *-linux-* ]]; then
+            if [[ "$target" == *-x86_64-* ]]; then
+              if [[ "$target" == *-musl* ]]; then
+                asset_suffix="-linux-x86_64-static"
+              else
+                asset_suffix="-linux-x86_64"
+              fi
+            elif [[ "$target" == *-aarch64-* ]]; then
+              if [[ "$target" == *-musl* ]]; then
+                asset_suffix="-linux-arm64-static"
+              else
+                asset_suffix="-linux-arm64"
+              fi
+            elif [[ "$target" == *-i686-* ]]; then
+              if [[ "$target" == *-musl* ]]; then
+                asset_suffix="-linux-i686-static"
+              else
+                asset_suffix="-linux-i686"
+              fi
+            elif [[ "$target" == *-armv7-* ]]; then
+              if [[ "$target" == *-musl* ]]; then
+                asset_suffix="-linux-armv7-static"
+              else
+                asset_suffix="-linux-armv7"
+              fi
+            fi
+          elif [[ "$target" == wasm32-* ]]; then
+            asset_suffix=".wasm"
+          fi
+          
+          # Set binary paths
+          BIN_PATH="target/$target/release/$PACKAGE_NAME$extension"
+          ASSET_NAME="$PACKAGE_NAME$asset_suffix"
+          
+          echo "Binary path: $BIN_PATH"
+          echo "Asset name: $ASSET_NAME"
+          
+          # Generate SHA256
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            sha256sum "$BIN_PATH" > "$BIN_PATH.sha256"
+          else
+            shasum -a 256 "$BIN_PATH" > "$BIN_PATH.sha256"
+          fi
+          
+          # Upload binary
+          gh release upload "v${{ steps.check.outputs.version }}" "$BIN_PATH" --clobber --name "$ASSET_NAME"
+          gh release upload "v${{ steps.check.outputs.version }}" "$BIN_PATH.sha256" --clobber --name "$ASSET_NAME.sha256"
+        done
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+    
+    # Build cross targets (Linux only)
+    - name: Build cross targets
+      if: runner.os == 'Linux' && steps.check.outputs.should_release == 'true' && steps.determine-builds.outputs.cross_targets != ''
+      shell: bash
+      run: |
+        PACKAGE_NAME="${{ steps.get-name.outputs.package_name }}"
+        
+        # Loop through all cross targets
+        for target in ${{ steps.determine-builds.outputs.cross_targets }}; do
+          echo "Building cross target: $target"
+          
+          # Determine file extension
+          extension=""
+          if [[ "$target" == *-windows-* ]]; then
+            extension=".exe"
+          elif [[ "$target" == *wasm32-* ]]; then
+            extension=".wasm"
+          fi
+          
+          # Determine asset name suffix
+          asset_suffix=""
+          if [[ "$target" == *-windows-* ]]; then
+            if [[ "$target" == *-x86_64-* ]]; then
+              asset_suffix="-windows-x86_64.exe"
+            elif [[ "$target" == *-i686-* ]]; then
+              asset_suffix="-windows-i686.exe"
+            elif [[ "$target" == *-aarch64-* ]]; then
+              asset_suffix="-windows-arm64.exe"
+            fi
+          elif [[ "$target" == *-apple-* ]]; then
+            if [[ "$target" == *-x86_64-* ]]; then
+              asset_suffix="-macos-x86_64"
+            elif [[ "$target" == *-aarch64-* ]]; then
+              asset_suffix="-macos-arm64"
+            fi
+          elif [[ "$target" == *-linux-* ]]; then
+            if [[ "$target" == *-x86_64-* ]]; then
+              if [[ "$target" == *-musl* ]]; then
+                asset_suffix="-linux-x86_64-static"
+              else
+                asset_suffix="-linux-x86_64"
+              fi
+            elif [[ "$target" == *-aarch64-* ]]; then
+              if [[ "$target" == *-musl* ]]; then
+                asset_suffix="-linux-arm64-static"
+              else
+                asset_suffix="-linux-arm64"
+              fi
+            elif [[ "$target" == *-i686-* ]]; then
+              if [[ "$target" == *-musl* ]]; then
+                asset_suffix="-linux-i686-static"
+              else
+                asset_suffix="-linux-i686"
+              fi
+            elif [[ "$target" == *-armv7-* ]]; then
+              if [[ "$target" == *-musl* ]]; then
+                asset_suffix="-linux-armv7-static"
+              else
+                asset_suffix="-linux-armv7"
+              fi
+            fi
+          elif [[ "$target" == wasm32-* ]]; then
+            asset_suffix=".wasm"
+          fi
+          
+          # Set binary paths
+          BIN_PATH="target/$target/release/$PACKAGE_NAME$extension"
+          ASSET_NAME="$PACKAGE_NAME$asset_suffix"
+          
+          echo "Binary path: $BIN_PATH"
+          echo "Asset name: $ASSET_NAME"
+          
+          # Special handling for WebAssembly
+          if [[ "$target" == wasm32-* ]]; then
+            rustup target add wasm32-unknown-unknown
+            cargo build --release --target wasm32-unknown-unknown
+          else
+            # Create Cross.toml for OpenSSL if needed
+            if [[ "$target" != wasm32-* ]]; then
+              # Determine OpenSSL architecture
+              openssl_arch=""
+              if [[ "$target" == *-x86_64-* ]]; then
+                openssl_arch="amd64"
+              elif [[ "$target" == *-aarch64-* ]]; then
+                openssl_arch="arm64"
+              elif [[ "$target" == *-i686-* ]]; then
+                openssl_arch="i386"
+              elif [[ "$target" == *-armv7-* ]]; then
+                openssl_arch="armhf"
+              fi
+              
+              # Create Cross.toml
+              if [ -n "$openssl_arch" ]; then
+                cat > Cross.toml << EOF
+                [target.$target]
+                pre-build = [
+                    "dpkg --add-architecture $openssl_arch",
+                    "apt-get update",
+                    "apt-get install -y libssl-dev:$openssl_arch"
+                ]
+                EOF
+              fi
+            fi
+            
+            # Build using cross
+            cross build --release --target $target
+          fi
+          
+          # Generate SHA256
+          sha256sum "$BIN_PATH" > "$BIN_PATH.sha256"
+          
+          # Upload binary
+          gh release upload "v${{ steps.check.outputs.version }}" "$BIN_PATH" --clobber --name "$ASSET_NAME"
+          gh release upload "v${{ steps.check.outputs.version }}" "$BIN_PATH.sha256" --clobber --name "$ASSET_NAME.sha256"
+        done
+      env:
+        GH_TOKEN: ${{ inputs.token }}
