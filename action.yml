@@ -186,6 +186,7 @@ runs:
       shell: bash
       env:
         RUST_BACKTRACE: 1
+        GH_TOKEN: ${{ inputs.token }}
       run: |
         PACKAGE_NAME="${{ steps.get-name.outputs.package_name }}"
         
@@ -271,13 +272,13 @@ runs:
           gh release upload "v${{ steps.check.outputs.version }}" "$BIN_PATH" --clobber --name "$ASSET_NAME"
           gh release upload "v${{ steps.check.outputs.version }}" "$BIN_PATH.sha256" --clobber --name "$ASSET_NAME.sha256"
         done
-      env:
-        GH_TOKEN: ${{ inputs.token }}
     
     # Build cross targets (Linux only)
     - name: Build cross targets
       if: runner.os == 'Linux' && steps.check.outputs.should_release == 'true' && steps.determine-builds.outputs.cross_targets != ''
       shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
       run: |
         PACKAGE_NAME="${{ steps.get-name.outputs.package_name }}"
         
