@@ -36,7 +36,7 @@ jobs:
           fetch-depth: 2
 
       - name: Create Release
-        uses: tristanpoland/Rust-Release-Action@v1
+        uses: tristanpoland/rust-multi-platform-release@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 ```
